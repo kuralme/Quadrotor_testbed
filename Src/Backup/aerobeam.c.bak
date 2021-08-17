@@ -1,0 +1,633 @@
+/**
+  ******************************************************************************
+  * File Name          : aerobeam.c
+  * Description        : Custom Functions
+  ******************************************************************************
+  * This notice applies to any and all portions of this file
+  * that are not between comment pairs USER CODE BEGIN and
+  * USER CODE END. Other portions of this file, whether 
+  * inserted by the user or by software development tools
+  * are owned by their respective copyright owners.
+  *
+  * Copyright (c) 2017 STMicroelectronics International N.V. 
+  * All rights reserved.
+  *
+  * Redistribution and use in source and binary forms, with or without 
+  * modification, are permitted, provided that the following conditions are met:
+  *
+  * 1. Redistribution of source code must retain the above copyright notice, 
+  *    this list of conditions and the following disclaimer.
+  * 2. Redistributions in binary form must reproduce the above copyright notice,
+  *    this list of conditions and the following disclaimer in the documentation
+  *    and/or other materials provided with the distribution.
+  * 3. Neither the name of STMicroelectronics nor the names of other 
+  *    contributors to this software may be used to endorse or promote products 
+  *    derived from this software without specific written permission.
+  * 4. This software, including modifications and/or derivative works of this 
+  *    software, must execute solely and exclusively on microcontroller or
+  *    microprocessor devices manufactured by or for STMicroelectronics.
+  * 5. Redistribution and use of this software other than as permitted under 
+  *    this license is void and will automatically terminate your rights under 
+  *    this license. 
+  *
+  * THIS SOFTWARE IS PROVIDED BY STMICROELECTRONICS AND CONTRIBUTORS "AS IS" 
+  * AND ANY EXPRESS, IMPLIED OR STATUTORY WARRANTIES, INCLUDING, BUT NOT 
+  * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY, FITNESS FOR A 
+  * PARTICULAR PURPOSE AND NON-INFRINGEMENT OF THIRD PARTY INTELLECTUAL PROPERTY
+  * RIGHTS ARE DISCLAIMED TO THE FULLEST EXTENT PERMITTED BY LAW. IN NO EVENT 
+  * SHALL STMICROELECTRONICS OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+  * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+  * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, 
+  * OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF 
+  * LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING 
+  * NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE,
+  * EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+  *
+  ******************************************************************************
+  */
+	    
+
+/* 
+ * PIN Definitions:
+ * PB0 :  Green LED (LD1)			HAL_GPIO_TogglePin(GPIOB,GPIO_PIN_0);
+ * PB7 :  Blue  LED (LD2)			HAL_GPIO_WritePin(GPIOB,GPIO_PIN_7,GPIO_PIN_SET);
+ * PB14: Red   LED (LD3)			HAL_GPIO_WritePin(GPIOB,GPIO_PIN_14,GPIO_PIN_SET);
+ * 
+ * PE0 : Buzzer								HAL_GPIO_WritePin(GPIOE,GPIO_PIN_0,GPIO_PIN_SET);
+ * PC13: Blue User Button			HAL_GPIO_ReadPin(GPIOC,GPIO_PIN_13)==GPIO_PIN_SET
+ * 
+ * USB CDC Transmit template:
+ *	   cdc_tr_len=sprintf((char *)cdc_tr_buff,"EXAMPLE TEXT: %d \n",EXAMPLE_VARIABLE1);
+  	   CDC_Transmit_FS(cdc_tr_buff,cdc_tr_len);
+ * 
+ * USART3 Transmit template (over ST-LINK USB):  //230400 baud
+ *		 cdc_tr_len=sprintf((char *)cdc_tr_buff,"EXAMPLE TEXT: %d \n",EXAMPLE_VARIABLE1);
+       HAL_UART_Transmit(&huart3,cdc_tr_buff,cdc_tr_len,100);
+ *		
+ *	
+ */
+
+
+#include "aerobeam.h"
+#include "stm32f7xx_hal.h"
+#include "usbd_cdc_if.h"
+#include "tim.h"
+#include "i2c.h"
+#include "usart.h"
+#include "math.h"
+#include "mpu6050_map.h"
+
+
+uint8_t  CDCReceiveNewData=0;
+uint32_t CDCReceiveLength=0;
+uint8_t  cdc_tr_buff[128];
+uint8_t  cdc_tr_len = 0;
+
+uint16_t motor1=0;  // Value Between: 0 - 1000
+uint16_t motor2=0;						
+uint16_t motor3=0;
+uint16_t motor4=0;
+
+// I2C ve hesaplama degiskenleri
+uint8_t TxBuffer[1], RxBuffer[1], DataBuffer[14];
+int16_t DataBuffer16[7];
+float accel_x_offset, accel_y_offset, accel_z_offset, temp_offset, gyro_x_offset, gyro_y_offset, gyro_z_offset;
+float acx_offset, acy_offset;
+float accel_x_raw, accel_y_raw, accel_z_raw, temp_raw, gyro_x_raw, gyro_y_raw, gyro_z_raw;
+float accel_x, accel_y, accel_z, temp, gyro_x, gyro_y, gyro_z, gyro_z_dot;
+float acx, acy, acz, roll, pitch, yaw;
+float previous_time, time, elapsed_time;
+float rad_to_deg = 57.2957;
+char t[100];
+
+// PID degiskenleri
+//float pwmN=100, pwmE=100, pwmS=100, pwmW=100;
+float error1, error2, error3, previous_error1, previous_error2, previous_error3;
+float PID1, PID2, PID3, pid_p1, pid_p2, pid_p3, pid_i1, pid_i2, pid_i3, pid_d1, pid_d2, pid_d3;
+float desired_angle_p, desired_angle_r, desired_angle_y;  // Sabit tutulmak istenen açilar
+float throttle=400;  // motor itis kuvveti baslangic degeri
+
+
+//*******PID Katsayilari******/
+float kp=0.6;      //3.55  
+float ki=0.01;     //0.005
+float kd=0.2;      //2.05
+/*****************************/
+
+
+// Receive_check degiskenleri
+extern uint8_t UserRxBufferFS[64];
+float p1,p2,p3,i1,i2,i3,d1,d2,d3,pp1,pp2,mp1,mp2,pr1,pr2,mr1,mr2;
+int emergency;
+
+
+uint8_t AB_setup(void)
+{
+	AB_animation();
+	
+	HAL_Delay(1000);
+	sprintf(t, "Initializing esc for 6 sec...\r\n");
+  CDC_Transmit_FS((uint8_t *)t, strlen((char *)t));
+	for(int i=0;i<strlen((char *)t);i++)t[i]='\0';
+	
+  AB_pwm_update(0,0,0,0);
+	HAL_Delay(6000); // ESCler için 6 saniye kalibrasyon	
+	
+	//MPU6050 hazirlik
+	MPU6050_Initialize();
+  MPU6050_Offset();
+	
+	return 0;
+}
+
+
+uint8_t AB_loop_while(void)
+{
+
+  return 0;
+}
+
+
+uint8_t AB_loop_1Hz(void)
+{
+  
+	return 0;
+}
+
+uint8_t AB_loop_4Hz(void)
+{
+  //HAL_GPIO_TogglePin(GPIOB,GPIO_PIN_0);
+	
+	return 0;
+}
+
+uint8_t AB_loop_10Hz(void)
+{
+
+	return 0;
+}
+
+uint8_t AB_loop_20Hz(void)
+{
+	
+	return 0;
+}
+
+uint8_t AB_loop_50Hz(void)
+{
+	
+	return 0;
+}
+
+
+uint8_t AB_loop_100Hz(void)
+{
+	  previous_time = time;                              // önceki sayaç degeri
+		time ++;                                           // zaman
+    elapsed_time = (time - previous_time) / 100.0F;    // geçen zaman (sn)
+		
+	  //Tüm sensor(X,Y,Z) degerleri sirasiyla önce H sonra L byte olmak üzere okunarak buffera atilir
+	  //MPU6050_RA_ACCEL_XOUT_H  0x3B
+	  AB_i2c_read(MPU6050_DEFAULT_ADDRESS, MPU6050_RA_ACCEL_XOUT_H, DataBuffer, 14);
+	  //HAL_I2C_Mem_Read(&hi2c1, MPU6050_DEFAULT_ADDRESS, MPU6050_RA_ACCEL_XOUT_H, I2C_MEMADD_SIZE_8BIT, DataBuffer, 14, 10000);		
+	  for(int i=0;i<7;i++)
+      DataBuffer16[i] = (int16_t)(((uint16_t)DataBuffer[2*i]<<8) | DataBuffer[2*i + 1]);
+			   
+	  Calculate();       // Alinan verileri düzenle
+		 
+		 // Acil durum: Motorlari 10sn durdurma
+		if(emergency==1)
+     {
+			int count;
+	    count++;
+	    AB_pwm_update(0,0,0,0);
+		  if(count==1000)
+		   {
+	     HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_RESET);
+		   emergency=0;
+		   count=0;
+		   }
+	   }
+	   else
+	    PID_Control();    // PID kontolü motorlara uygula
+	
+     Tprint();          // Terminale yazdir
+     Receive_Check();   // Terminalden veri alma
+
+	return 0;
+}
+
+uint8_t AB_loop_1000Hz(void)
+{
+	AB_CDC_receive_check();
+	
+	return 0;
+}
+
+
+
+
+uint16_t loop_counter=0;
+
+uint8_t AB_timer_interrupt(void)
+{
+	loop_counter++;
+	AB_loop_1000Hz();
+	if (loop_counter%10  == 0 ) AB_loop_100Hz();
+	if (loop_counter%20  == 0 ) AB_loop_50Hz();
+	if (loop_counter%50  == 0 ) AB_loop_20Hz();
+	if (loop_counter%100 == 0 ) AB_loop_10Hz();
+	if (loop_counter%250 == 0 ) AB_loop_4Hz();
+	if (loop_counter>=1000) 
+	{
+		AB_loop_1Hz();
+		loop_counter=0;
+	}
+	return 0;
+}
+
+uint8_t AB_animation(void)
+{
+  HAL_GPIO_WritePin(GPIOB,GPIO_PIN_0,GPIO_PIN_SET); HAL_Delay(200);
+	HAL_GPIO_WritePin(GPIOB,GPIO_PIN_7,GPIO_PIN_SET); HAL_Delay(200);
+	HAL_GPIO_WritePin(GPIOB,GPIO_PIN_14,GPIO_PIN_SET); HAL_Delay(200);
+	HAL_GPIO_WritePin(GPIOB,GPIO_PIN_0,GPIO_PIN_RESET);
+	HAL_GPIO_WritePin(GPIOB,GPIO_PIN_7,GPIO_PIN_RESET);
+	HAL_GPIO_WritePin(GPIOB,GPIO_PIN_14,GPIO_PIN_RESET);
+	
+	HAL_GPIO_WritePin(GPIOE,GPIO_PIN_0,GPIO_PIN_SET);  HAL_Delay(100);
+	HAL_GPIO_WritePin(GPIOE,GPIO_PIN_0,GPIO_PIN_RESET);HAL_Delay(10);
+	HAL_GPIO_WritePin(GPIOE,GPIO_PIN_0,GPIO_PIN_SET);  HAL_Delay(100);
+	HAL_GPIO_WritePin(GPIOE,GPIO_PIN_0,GPIO_PIN_RESET);HAL_Delay(10);
+	HAL_GPIO_WritePin(GPIOE,GPIO_PIN_0,GPIO_PIN_SET);  HAL_Delay(100);
+	HAL_GPIO_WritePin(GPIOE,GPIO_PIN_0,GPIO_PIN_RESET);HAL_Delay(10);
+	return 0;
+}
+
+uint8_t AB_pwm_update(uint16_t motr1, 
+											uint16_t motr2, 
+											uint16_t motr3, 
+											uint16_t motr4)
+{
+  TIM4->CCR1 = motr1+1000;
+	TIM4->CCR2 = motr2+1000;
+	TIM4->CCR3 = motr3+1000;
+	TIM4->CCR4 = motr4+1000;
+  return 0;
+}
+
+
+uint8_t AB_i2c_read(uint8_t device_address_7bit, uint8_t reg_address, uint8_t *read_buffer, uint8_t read_lentgh)
+{
+  HAL_I2C_Master_Transmit(&hi2c1,device_address_7bit<<1,&reg_address,1,100);
+	HAL_I2C_Master_Receive(&hi2c1,device_address_7bit<<1,read_buffer,read_lentgh,100);
+	return 0;
+}
+
+uint8_t AB_i2c_write(uint8_t device_address_7bit, uint8_t reg_address, uint8_t *write_buffer, uint8_t write_lentgh)
+{
+	uint8_t i2c_temp[64]={0};
+	i2c_temp[0]=reg_address;
+	for(uint8_t t=1;t<=write_lentgh;t++)
+	{
+	  i2c_temp[t]=write_buffer[t-1];
+	}
+  HAL_I2C_Master_Transmit(&hi2c1,device_address_7bit<<1,i2c_temp,write_lentgh+1,100);
+	return 0;
+}
+
+
+uint8_t AB_CDC_receive_check(void)
+{
+	
+  if(CDCReceiveNewData==1)
+	{
+		CDCReceiveNewData=0;
+		//UserRxBufferFS : Receive Buffer
+		Receive_Check();
+	}
+	return 0;
+}
+
+
+uint8_t usart3_rx_data[2];
+
+uint8_t AB_usart3_interrupt(void)
+{
+	// usart3_rx_data[0] : Receive Buffer
+	
+	return 0;
+}
+
+
+float AB_limit(float val, float lim)
+{
+  if(val > lim) val = lim;
+	if(val < -lim) val = -lim;
+	return val;
+}
+
+
+uint8_t AB_calculate_lrc(uint8_t *data, uint8_t data_size)
+{
+    uint8_t LRC = 0x00;
+    for (uint8_t t = 0; t < data_size; ++t) LRC ^= data[t];
+    return LRC;
+}
+
+
+void MPU6050_Initialize()
+{
+//Device reset yapilarak güç aç1ildi***************************************************************************
+//MPU6050_RA_PWR_MGMT_1   0x6B
+TxBuffer[0] = 0x80; //reset
+HAL_I2C_Mem_Write(&hi2c1, MPU6050_DEFAULT_ADDRESS, MPU6050_RA_PWR_MGMT_1, 1, TxBuffer, 2, 1000);
+HAL_Delay(200);
+//Internal clock(8Mhz)
+TxBuffer[0] = MPU6050_CLOCK_INTERNAL; // 0x00
+HAL_I2C_Mem_Write(&hi2c1, MPU6050_DEFAULT_ADDRESS, MPU6050_RA_PWR_MGMT_1, 1, TxBuffer, 2, 1000);
+HAL_Delay(200);
+//*************************************************************************************************************
+
+//Butun sensorler(gyro,accel,temp) hazirlandi******************************************************************
+//MPU6050_RA_FIFO_EN   0x23
+TxBuffer[0] = 0xF8; 
+HAL_I2C_Mem_Write(&hi2c1, MPU6050_DEFAULT_ADDRESS, MPU6050_RA_FIFO_EN, 1, TxBuffer, 2, 1000);
+HAL_Delay(200);
+//Sensor verileri buffera atilmak üzere ayarlandi FIFO_buffer(Slave 1)
+TxBuffer[0] = 0x10; 
+HAL_I2C_Mem_Write(&hi2c1, MPU6050_DEFAULT_ADDRESS, MPU6050_RA_FIFO_EN, 1, TxBuffer, 2, 1000);
+HAL_Delay(200);
+//*************************************************************************************************************
+
+//Dijital low pass filter ayarlama*****************************************************************************
+//MPU6050_RA_CONFIG     0x1A
+TxBuffer[0] = 0x06;
+HAL_I2C_Mem_Write(&hi2c1, MPU6050_DEFAULT_ADDRESS, MPU6050_RA_CONFIG, 1, TxBuffer, 2, 1000);
+HAL_Delay(200);
+//*************************************************************************************************************
+
+//Gyro(açisal hiz ölçer) ayarlama******************************************************************************
+//MPU6050_RA_GYRO_CONFIG   0x1B
+TxBuffer[0] = 0x18;  //Gyro FSO +- 2000 °/s
+HAL_I2C_Mem_Write(&hi2c1, MPU6050_DEFAULT_ADDRESS, MPU6050_RA_GYRO_CONFIG, 1, TxBuffer, 2, 1000);
+HAL_Delay(200);
+//*************************************************************************************************************
+
+//Ivme olçer ayarlama******************************************************************************************
+//MPU6050_RA_ACCEL_CONFIG   0x1C
+TxBuffer[0] = 0x18;  //Accelerator FSO +- 16g 
+HAL_I2C_Mem_Write(&hi2c1, MPU6050_DEFAULT_ADDRESS, MPU6050_RA_ACCEL_CONFIG, 1, TxBuffer, 2, 1000);
+HAL_Delay(200);
+//*************************************************************************************************************
+
+/**************************************************************************/
+/* Gyro FSO           +- 2000 °/s       ( Sensitivity = 16.4 LSB/(°/s))   */
+/* Accelerator FSO    +- 16g            ( Sensitivity = 2048 LSB/(°/s))	  */
+/* Temperature FSO    -40/+65 °C        ( Sensitivity = 340  LSB/(°/s))   */
+/**************************************************************************/
+
+}
+
+void MPU6050_Offset()
+{
+   HAL_I2C_Mem_Read(&hi2c1, MPU6050_DEFAULT_ADDRESS, MPU6050_RA_ACCEL_XOUT_H, I2C_MEMADD_SIZE_8BIT, DataBuffer, 14, 10000);		
+	 for(int i=0;i<7;i++){
+       DataBuffer16[i] = (int16_t)((DataBuffer[2*i]<<8) | DataBuffer[2*i + 1]);
+			}
+	 for (int k=0; k<10;k++){
+ //accel_x_offset += DataBuffer16[0];
+ //accel_y_offset += DataBuffer16[1];   
+ //accel_z_offset += DataBuffer16[2];
+ //temp_offset    += DataBuffer16[3];
+   gyro_x_offset  += DataBuffer16[4];
+   gyro_y_offset  += DataBuffer16[5];
+	 gyro_z_offset  += DataBuffer16[6];
+   HAL_Delay(20);
+   }
+ //temp_offset    = temp_offset    / 10.0F;
+   gyro_x_offset  = gyro_x_offset  / 10.0F;
+   gyro_y_offset  = gyro_y_offset  / 10.0F;
+   gyro_z_offset  = gyro_z_offset  / 10.0F;	 
+}
+
+void Calculate()
+{	
+	// Accel kalibrasyon
+	accel_x_raw = DataBuffer16[0];
+  accel_x = accel_x_raw / 2048.0F; 
+  accel_y_raw = DataBuffer16[1]; 
+  accel_y = accel_y_raw / 2048.0F;
+  accel_z_raw = DataBuffer16[2]; 
+  accel_z = accel_z_raw / 2048.0F;
+	
+	// Temp kalibrasyon 
+	//temp_raw = DataBuffer16[3]; 
+	//temp = (temp_raw - temp_offset) / 340.0F;
+	
+	// Gyro kalibrasyon
+	gyro_x_raw = DataBuffer16[4]; 	
+	gyro_x = (gyro_x_raw - gyro_x_offset) / 16.4F; 
+	gyro_y_raw = DataBuffer16[5];
+  gyro_y = (gyro_y_raw - gyro_y_offset) / 16.4F; 
+  gyro_z_raw = DataBuffer16[6]; 
+  
+  // Gyro_z kalibrasyon	
+	gyro_z_dot = (gyro_z_raw - gyro_z_offset);
+	
+	if( -3.0F < gyro_z_dot < 3.0F )
+	  gyro_z_dot = 0.0F;
+  else
+	  gyro_z_dot = gyro_z_dot + ( gyro_z_dot / 16.4F )*elapsed_time;
+	
+	gyro_z = gyro_z_dot;
+	
+	/* Açilar için Euler Formulleri*/
+  /****************** Ivme ölçer x açisi ************************/
+  acx = atan2(accel_y, accel_z)*rad_to_deg;
+  /****************** Ivme ölçer y açisi ************************/
+  acy = atan2(accel_x, accel_z)*rad_to_deg;
+	/****************** Ivme ölçer z açisi ************************/
+  acz = atan2(accel_x, accel_y)*rad_to_deg;
+	
+	/*************** COMPLEMENTARY FILTER *************************/
+  roll  = 0.98F *(roll  + gyro_x*elapsed_time) + 0.02F *acx;
+  pitch = 0.98F *(pitch + gyro_y*elapsed_time) + 0.02F *acy;
+	yaw   = 0.98F *(yaw   + gyro_z) + 0.02F *acz;
+}
+
+void PID_Control()
+{
+   /********************* P I D *******************************/
+   // PID deger hesabi 3 eksene göre yapiliyor (roll pitch yaw)
+   
+	 error1 = roll  - desired_angle_r;
+	 error2 = pitch - desired_angle_p;   
+	 error3 = yaw   - desired_angle_y;
+   
+   /******************** P **************************/
+   pid_p1 = kp*error1;
+	 pid_p2 = kp*error2;
+	 pid_p3 = kp*error3;
+	
+   /******************** I **************************/
+	  if( -5< error1 <5 )
+		pid_i1 +=(ki*error1);
+    
+		if( -5< error2 <5 )
+		pid_i2 +=(ki*error2);
+		
+		if( -5< error3 <5 )
+		pid_i3 +=(ki*error3);
+		
+		AB_limit(pid_i1, 15);
+		AB_limit(pid_i2, 15);
+		AB_limit(pid_i3, 10);
+		
+   /******************* D ***************************/
+   	pid_d1 = kd*((error1 - previous_error1)/elapsed_time);
+    pid_d2 = kd*((error2 - previous_error2)/elapsed_time);
+    pid_d3 = kd*((error3 - previous_error3)/elapsed_time);
+		
+		AB_limit(pid_d1, 15);
+		AB_limit(pid_d2, 15);
+		AB_limit(pid_d3, 10);
+		
+   /************* Toplam PID ************************/
+    PID1 = pid_p1 + pid_i1 + pid_d1;
+    PID2 = pid_p2 + pid_i2 + pid_d2;
+	  PID3 = pid_p3 + pid_i3 + pid_d3;
+		
+		AB_limit(PID1, 35);
+		AB_limit(PID2, 35);
+		AB_limit(PID3, 25);
+
+   /*Motorlara uygulanacak PID degeri gerekli kuvvete eklenir*/
+   motor4 = throttle - PID1 - PID3;
+   motor2 = throttle + PID1 + PID3;
+	 
+	 motor3 = throttle - PID2 - PID3;
+	 motor1 = throttle + PID2 + PID3;
+    
+		
+   // Kuzey motor çalisma bölgesi
+   if(motor1 < 200)
+    motor1= 200;		
+   if(motor1 > 700)
+    motor1=700;
+		
+   // Dogu motor çalisma bölgesi
+   if(motor2 < 200)
+    motor2= 200;		
+   if(motor2 > 700)
+    motor2=700;
+		
+	 // Güney motor çalisma bölgesi
+   if(motor3 < 200)
+    motor3= 200;		
+   if(motor3 > 700)
+    motor3=700;
+		
+		// Bati motor çalisma bölgesi
+   if(motor4 < 200)
+    motor4= 200;		
+   if(motor4 > 700)
+    motor4=700;		
+   
+
+   // PWM degerleri motorlara uygulanir
+	 AB_pwm_update(motor1, motor2, motor3, motor4);
+		
+   //Önceki hata degerleri kaydedilir
+	 previous_error1 = error1;
+   previous_error2 = error2;
+	 previous_error3 = error3;
+}
+
+void Tprint()
+{	
+  if( emergency==1)
+  {
+	 motor1 = htim4.Instance->CCR1;
+	 motor2 = htim4.Instance->CCR2;
+	 motor3 = htim4.Instance->CCR3;
+	 motor4 = htim4.Instance->CCR4;
+	 sprintf(t, "<<< Emergency Mode >>>\r\nStopping motors for 10sec...\r\nRPY= %3.2f\t%3.2f\t%3.2f\r\nN=%3.2d\tE=%3.2d\tS=%3.2d\tW=%3.2d\r\n\r\n", roll, pitch, yaw, motor1, motor2, motor3, motor4);
+   CDC_Transmit_FS((uint8_t *)t, strlen((char *)t));
+	}
+	else{
+	sprintf(t, "Roll=%3.2f\tPitch=%3.2f\tYaw=%3.2f\r\nN=%3.2d\tE=%3.2d\r\nS=%3.2d\tW=%3.2d\r\n\r\n", roll, pitch, yaw, motor1, motor2, motor3, motor4);
+  CDC_Transmit_FS((uint8_t *)t, strlen((char *)t));
+	}
+}
+
+void Receive_Check()
+{
+	if(UserRxBufferFS[0]!='\0') //data alinmissa
+      {
+			// PID katsayilari okuma ve güncelleme
+			if( UserRxBufferFS[0]=='k' || UserRxBufferFS[0]=='K')
+			{
+				 if( UserRxBufferFS[1]=='p')
+					{					
+					 p1=UserRxBufferFS[3];
+					 p2=UserRxBufferFS[5];
+					 p3=UserRxBufferFS[6];
+					 kp= 1.0F*p1 + 0.01F*p2 + 0.001F*p3;
+					}					
+				else if( UserRxBufferFS[1]=='i')
+					{
+					 i1=UserRxBufferFS[3];
+					 i2=UserRxBufferFS[5];
+					 i3=UserRxBufferFS[6];
+					 ki= 1.0F*i1 + 0.01F*i2 + 0.001F*i3;
+					 for(int i=0;i<10;i++){ UserRxBufferFS[i]='\0';}
+					}
+				else if( UserRxBufferFS[1]=='d')
+					{
+					 d1=UserRxBufferFS[3];
+					 d2=UserRxBufferFS[5];
+					 d3=UserRxBufferFS[6];
+					 kd= 1.0F*d1 + 0.01F*d2 + 0.001F*d3;
+					}
+			 }		
+		 // Pitch pozitif açi okuma
+		 if(UserRxBufferFS[0]=='p' && UserRxBufferFS[1]=='p')
+			{ 
+			 pp1=UserRxBufferFS[3];
+			 pp2=UserRxBufferFS[5];
+			 desired_angle_p= 1.0F*pp1 + 0.1F*pp2;
+		  }
+			// Pitch negatif açi okuma
+		 if(UserRxBufferFS[0]=='m' && UserRxBufferFS[1]=='p')
+			{
+			 mp1=UserRxBufferFS[3];
+			 mp2=UserRxBufferFS[5];
+			 desired_angle_p= -1.0F*mp1 + -0.1F*mp2;
+			}
+			// Roll pozitif açi okuma
+		 if(UserRxBufferFS[0]=='p' && UserRxBufferFS[1]=='r')
+			{
+			 pr1=UserRxBufferFS[3];
+			 pr2=UserRxBufferFS[5];
+			 desired_angle_r= 1.0F*pr1 + 0.1F*pr2;
+		  }
+			// Roll negatif açi okuma
+		 if(UserRxBufferFS[0]=='m' && UserRxBufferFS[1]=='r')
+			{
+			 mr1=UserRxBufferFS[3];
+			 mr2=UserRxBufferFS[5];
+			 desired_angle_r= -1.0F*mr1 + -0.1F*mr2;
+			}
+			// Motorlari 10snligine durdurma
+		 if(UserRxBufferFS[0]=='s')
+		 {
+			 if( UserRxBufferFS[2]=='1')
+			 {
+         HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_SET);
+				 emergency=1;
+			 } 
+		 }
+		 for(int i=0;i<10;i++) UserRxBufferFS[i]='\0';
+		}
+}
