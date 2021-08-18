@@ -1,0 +1,13 @@
+ <launch>
+  <arg name="joy_dev" default="/dev/input/js0" />
+ <node pkg="joy" type="joy_node" name="joy_node">
+    <param name="dev" value="$(arg joy_dev)" />
+    <param name="deadzone" value="0.3" />
+    <param name="autorepeat_rate" value="20" />
+  </node>
+<!-- Use sudo chmod 666 /dev/ttyUSB0 to give authority to serial port after finding your device port with ls -l /dev | grep ttyUSB -->
+ <node name="joy_py" pkg="joy_ros" type="joy_communication.py" output="screen">
+ <param name="/port" value="/dev/ttyACM1" />
+ <param name="/baud" value="115200" />
+ </node>
+</launch>
