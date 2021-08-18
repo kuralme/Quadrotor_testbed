@@ -6,7 +6,7 @@ The purpose of the project was angle control of a stationary 4-DOF (non-hovering
 The control method is PID and the constants are tuned empirically (manual tuning method)
 
 Demo video:
-
+https://youtu.be/svHYbfm_wV0
 
 More details are available on the thesis
 https://drive.google.com/file/d/1CeJ5bQGfB9dTfHgFVUi1hLkSoSA0svkV/view?usp=sharing
