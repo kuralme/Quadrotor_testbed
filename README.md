@@ -1,7 +1,7 @@
 # Quadrotor_testbed
 My Bsc graduation project
 
-The purpose of the project was angle control of a stationary 4-DOF (non-hovering) quadrotor system. The main system runs on an STM32F7 mc board, running C real-time executing sensor communication, motor speed (PWM) and the PID algorithms. The PID constants were tuned empirically (via manual tuning method). Reference angle is given from a joystick with running python-ROS script externally from another pc. The body frame is majorly made of makeblock mechanical parts
+The purpose of the project was angle control of a stationary 4-DOF (non-hovering) quadrotor system. The main system runs on an STM32F7 mc board, running C real-time executing sensor communication, motor speed (PWM) and the PID algorithms. Heuristic approach (via trial-error method) was taken to tune the PID constants. The reference angle was given from a joystick with running python-ROS script externally from another pc. The body frame was majorly made of makeblock mechanical parts
 
 <p align="center">
  <img src="./aero.jpg" scale=".5">
